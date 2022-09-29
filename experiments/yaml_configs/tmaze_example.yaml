@@ -1,0 +1,61 @@
+# Example yaml for tmaze environment. 
+# Note: This is a combined env and model example. 
+#       For experiments with models defined seperately, see other folders in this directory.
+temp_tmaze: # Folder name for output
+    trial_name: AMRL-AVG # String must be in all CAPS, dashes, and underscores. It will be used as the model name. It should be unique within the directory defined on prior line.
+    run: PPO
+    checkpoint_freq: 1
+    checkpoint_at_end: True
+    stop:
+        timesteps_total: 250000
+    config: 
+        opt_type: adam
+        gamma: 0.98
+        num_workers: 5
+        num_envs_per_worker: 2
+        num_gpus: 1
+        observation_filter: "NoFilter"
+        # In order to avoid Rllib bugs in old version, we specify truncate but make sure sample_batch_size > timeout in env
+        # (Note, since sample_batch_size > sgd_minibatch_size, this should break if not the case)
+        sample_batch_size: 200 # number of steps into episode to sample.
+        train_batch_size: 4000 # number of steps to wait until train
+        sgd_minibatch_size: 200 # must be > min(timeout, sample_batch_size), I believe, to hold at least one episode (e.g. PPO) ###200
+        num_sgd_iter: 30
+        batch_mode: "truncate_episodes" # "complete_episodes" or "truncate_episodes"
+        fetch_lstm_gates: True # These fetches will automiatcally be saved to disk by t_maze.py ############
+        model:
+            use_lstm: True
+            max_seq_len: 10000
+            slot1: lstm
+            slot2: avg
+            sum_instead: False
+            max_instead: False
+            straight_through: True
+        env_config:
+            check_up: 8 # Observation for check / noise pointed up
+            check_down: 6
+            pos_enc: False
+            wave_encoding_len: null # Can be null for no not wave-based encoding
+            task_switch_after: null # Override some settings to switch from short term task to long after x steps (or null)
+            intermediate_checks: False
+            intermediate_indicators: True # Whether there are intermediate indicators. (Even if no checks, will increase action dimension)
+            reset_intermediate_indicators: True # whether the intermediate indicators change from episode to episode
+            per_step_reset: True
+            num_indicators_components: 1 # The length of the intermediate indicators
+            frac_correct_components_for_check: 1 # The fraction of the components needed to be correct to move to next location (rounded up)
+            final_intermediate_indicator: True # Whether or not there is an intermediate indicator at then end
+            check_reward: 0.1
+            reward_per_correct_component: False # Whether to give check_reward * the fraction correct
+            allow_left: False
+            force_final_decision: True # Whether to force the agent to move up or down at end
+            force_right: True # Whether to force the agent to move right (not at end and not for checks)
+            timeout: 150 # Max steps allowed or null
+            timeout_reward: 0
+            maze_length: 100
+            maze_length_upper_bound: null # if specificied, will sample laze lengths form [maze_length, maze_length_upper_bound]
+            indicator_pos: 0
+            flipped_indicator_pos: null # Can be null for no duplicate flipped indicator
+            correlated_indicator_pos: null # Can be null for no correlated indicator
+            success_reward: 4.0
+            fail_reward: -0.1
+            persistent_reward: 0.0 # Reward given per time step

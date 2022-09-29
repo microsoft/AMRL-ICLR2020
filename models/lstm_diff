@@ -1,0 +1,420 @@
+diff --git a/Users/jake/Desktop/lstm.py b/models/lstm.py
+index 084ab7b..d4e600e 100644
+--- a/Users/jake/Desktop/lstm.py
++++ b/models/lstm.py
+@@ -1,7 +1,22 @@
+ from __future__ import absolute_import
+ from __future__ import division
+ from __future__ import print_function
+-"""LSTM support for RLlib.
++"""
++This file contains modified code from rllib
++(https://github.com/ray-project/ray/blob/f600591468d2226fb8ad700294c18cf215c5809d/python/ray/rllib/models/lstm.py)
++To recover from the given diff, you may use: patch lstm.py lstm_diff
++
++LSTM support for RLlib.
++
++Note:
++    For AMRL paper (https://iclr.cc/virtual_2020/poster_Bkl7bREtDr.html), 
++    this was modified to include 2 slots for 2 different rnns and connect them in parallel or in stacked.
++    However, this is a simplified version, and not the exact one used in the paper, so "set" model is not possible.
++    In order to run DNC in one of the slots, will need to install:
++        pip3 install tensorflow-probability==0.6.0
++        pip3 install dm-sonnet
++        pip3 install git+https://github.com/deepmind/dnc.git
++
+ 
+ The main trick here is that we add the time dimension at the last moment.
+ The non-LSTM layers of the model see their inputs as one flat batch. Before
+@@ -19,11 +34,20 @@ more info.
+ 
+ import numpy as np
+ import tensorflow as tf
+-import tensorflow.contrib.rnn as rnn
++import tensorflow.contrib.rnn as tf_rnn
++import tensorflow.contrib.slim as slim
+ 
+-from ray.rllib.models.misc import linear, normc_initializer
++from ray.rllib.models.misc import linear, normc_initializer, get_activation_fn
+ from ray.rllib.models.model import Model
+-from ray.rllib.utils.annotations import override, DeveloperAPI, PublicAPI
++from ray.rllib.utils.annotations import override
++from ray.rllib.models.average_rnn import AverageRNNCell
++from dnc.dnc import DNC
++
++from tensorflow.python.ops import nn_ops
++from tensorflow.python.framework import constant_op
++from tensorflow.python.ops import math_ops
++from tensorflow.python.ops import array_ops
++from tensorflow.python.ops import while_v2
+ 
+ 
+ class LSTM(Model):
+@@ -37,7 +61,17 @@ class LSTM(Model):
+ 
+     @override(Model)
+     def _build_layers_v2(self, input_dict, num_outputs, options):
+-        cell_size = options.get("lstm_cell_size")
++        self.slots = (options.get("slot1"), options.get("slot2")) # Defines types of RNNs in each slot
++        stacked = options.get("stacked_rnns")
++        assert self.slots[0] in {"lstm", "dnc", "avg"}, self.slots
++        assert self.slots[1] in {"lstm", "dnc", "avg", None}, self.slots
++        if self.slots == ("avg", None) or self.slots == ("avg", "avg"):
++            assert not options.get("parallel_input"), "avg model will already send half of input neurons around as a skip connection.\
++                                                       If you intend to have 1.5x the neurons go around, then remove this assert."
++        if self.slots == ("avg", "avg"):
++            assert stacked, "While stacking two avg models may not be wise, having them in tandem is certainly pointless;\
++                             avg is parameter-free and using two in tandem will simply double the output vector."
++        # Get inputs into correct sequential format
+         if options.get("lstm_use_prev_action_reward"):
+             action_dim = int(
+                 np.product(
+@@ -54,44 +88,280 @@ class LSTM(Model):
+         else:
+             features = input_dict["obs"]
+         last_layer = add_time_dimension(features, self.seq_lens)
++        self.enc = last_layer # encoded inputs to rnn1; save for later
++        enc_sz = int(self.enc.shape[-1])
+ 
+-        # Setup the LSTM cell
+-        lstm = rnn.BasicLSTMCell(cell_size, state_is_tuple=True)
++        # Setup the RNN cell in slot1
++        with tf.variable_scope('rnn1'):
++            self.rnn1, rnn1_c_sz, rnn1_h_sz, rnn1_output_sz = self.get_rnn(self.slots[0], enc_sz, options.get("slot1_output_size"), options)
++        # Setup the RNN cell in slot2, if necessary
++        if self.slots[1] is not None:
++            with tf.variable_scope('rnn2'):
++                rnn2_input_size = rnn1_output_sz if stacked else enc_sz
++                self.rnn2, rnn2_c_sz, rnn2_h_sz, rnn2_output_sz = self.get_rnn(self.slots[1], rnn2_input_size, options.get("slot2_output_size"), options)
++
++        # Define initial state (total memory for both slots)
++        total_c_sz = rnn1_c_sz if self.slots[1] is None else rnn1_c_sz+rnn2_c_sz
++        total_h_sz = rnn1_h_sz if self.slots[1] is None else rnn1_h_sz+rnn2_h_sz
+         self.state_init = [
+-            np.zeros(lstm.state_size.c, np.float32),
+-            np.zeros(lstm.state_size.h, np.float32)
++            np.zeros(total_c_sz, np.float32),
++            np.zeros(total_h_sz, np.float32)
+         ]
+ 
+-        # Setup LSTM inputs
++        # Setup inputs for state
+         if self.state_in:
+             c_in, h_in = self.state_in
+         else:
+             c_in = tf.placeholder(
+-                tf.float32, [None, lstm.state_size.c], name="c")
++                tf.float32, [None, total_c_sz], name="c")
+             h_in = tf.placeholder(
+-                tf.float32, [None, lstm.state_size.h], name="h")
++                tf.float32, [None, total_h_sz], name="h")
+             self.state_in = [c_in, h_in]
+ 
+-        # Setup LSTM outputs
+-        state_in = rnn.LSTMStateTuple(c_in, h_in)
+-        lstm_out, lstm_state = tf.nn.dynamic_rnn(
+-            lstm,
+-            last_layer,
+-            initial_state=state_in,
+-            sequence_length=self.seq_lens,
+-            time_major=False,
+-            dtype=tf.float32)
++        # Split up c and h memory between rnn1 and rnn2
++        if self.slots[1] is None:
++            rnn1_c_in = c_in
++            rnn1_h_in = h_in
++        else:
++            # Note: instead of packing these all into c_in and h_in, you should just be able to add any 
++            #       [batch_sz, -1] tensors to self.state_in and self.state_out, but this may be less compatible with callbacks
++            #       that assume only 1 of each c anf h vectors.
++            rnn1_c_in = c_in[:,:rnn1_c_sz]
++            rnn1_h_in = h_in[:,:rnn1_h_sz]
++            rnn2_c_in = c_in[:,rnn1_c_sz:]
++            rnn2_h_in = h_in[:,rnn1_h_sz:]
+ 
+-        self.state_out = list(lstm_state)
++        # Run rnn1
++        with tf.variable_scope('rnn1'):
++            rnn1_out, rnn1_state = self.run_rnn(self.rnn1, self.slots[0], last_layer, rnn1_c_in, rnn1_h_in)
+ 
+-        # Compute outputs
+-        last_layer = tf.reshape(lstm_out, [-1, cell_size])
++        # Save rnn1 gates for later (first step only, since one step is collected at a time during rollouts)
++        self.save_gates_first_step(self.rnn1, last_layer, rnn1_out, rnn1_c_in, rnn1_h_in, use_dummy_values=self.slots[0]!="lstm")
++
++        # Run rnn2, if necessary
++        if self.slots[1] is not None:
++            with tf.variable_scope('rnn2'):
++                rnn2_input_layer = rnn1_out if stacked else last_layer
++                rnn2_out, rnn2_state = self.run_rnn(self.rnn2, self.slots[1], rnn2_input_layer, rnn2_c_in, rnn2_h_in)
++
++        # Compute combined outputs
++        if self.slots[1] is None:
++            combo_state = rnn1_state
++            combo_out = rnn1_out
++        else:
++            combo_state = tf_rnn.LSTMStateTuple(tf.concat([rnn1_state.c, rnn2_state.c], axis=-1), tf.concat([rnn1_state.h, rnn2_state.h], axis=-1))
++            combo_out = rnn2_out if stacked else tf.concat((rnn1_out, rnn2_out), axis=-1)
++        self.state_out = list(combo_state)
++        self.recurrent_out = combo_out # Save for future info fetches
++        # Note: To print debug info, use the following line instead:
++            # debug_prints = [
++            #     tf.print("input:", tf.shape(self.enc)),
++            #     tf.print("rnn1_in:", tf.shape(self.enc)), 
++            #     tf.print("rnn1_out:", tf.shape(rnn1_out)),
++            #     tf.print("rnn2_in:", tf.shape(rnn2_input_layer) if self.slots[1] else None), 
++            #     tf.print("rnn2_out:", tf.shape(rnn2_out) if self.slots[1] else None),
++            #     tf.print("combo out:", tf.shape(combo_out)),
++            #     tf.print("total_c_sz:", total_c_sz),
++            #     tf.print("total_h_sz:", total_h_sz),
++            #     tf.print("gate check 0:", tf.reduce_sum(self.gate_check))
++            # ]
++        debug_prints = []
++        with tf.control_dependencies(debug_prints):
++            last_layer = tf.reshape(combo_out, [-1, combo_out.shape[-1]])
++        if options.get("parallel_input"):
++            last_layer = tf.concat((last_layer, features), axis=-1)
++        if options.get("final_hidden") is not None:
++            hidden_sz = options.get("final_hidden")
++            last_layer = slim.fully_connected(
++                            last_layer,
++                            hidden_sz,
++                            weights_initializer=normc_initializer(1.0),
++                            activation_fn=get_activation_fn(options.get("fcnet_activation")),
++                            scope="lstm_hidden_out")
+         logits = linear(last_layer, num_outputs, "action",
+                         normc_initializer(0.01))
+         return logits, last_layer
+ 
++    def save_gates_first_step(self, rnn, inputs, outputs, lstm_c_in, lstm_h_in, use_dummy_values=False):
++        if use_dummy_values:
++            self.i_gates = tf.zeros_like(lstm_c_in)
++            self.j_proposals = tf.zeros_like(lstm_c_in)
++            self.f_gates = tf.zeros_like(lstm_c_in)
++            self.o_gates = tf.zeros_like(lstm_c_in)
++        else:
++            i, j, f, o, h = gates(rnn, inputs[:, 0, :], lstm_c_in, lstm_h_in)
++            self.i_gates = i
++            self.j_proposals = j
++            self.f_gates = f
++            self.o_gates = o
++            # Check computation
++            h_0_from_forget = h
++            h_0 = outputs[:,0,:]
++            self.gate_check = h_0 - h_0_from_forget # Subtract h's. Should be matrix of all 0s
++
++    def do1_de0_2_don_de0_tensors(self, n, step=1):
++        ''' Use to get gradients for visualization '''
++        steps = range(0, n, step)
++        grads = [tf.gradients(self.recurrent_out[:,i,:], self.enc)[0][:,0,:] for i in steps]
++        return grads, steps
++
++    def run_rnn(self, rnn, rnn_type, inputs, c_in, h_in):
++        rnn_state_in = tf_rnn.LSTMStateTuple(c_in, h_in)
++        if rnn_type == "dnc": # Unpack memory
++            rnn_state_in = vector_2_dnc_state(rnn, c_in) # Reading from c arbitrarily, since storing copies in h too
++        elif rnn_type == "avg": # Split input for skip connection
++            inputs, skip_around = array_ops.split(value=inputs, num_or_size_splits=2, axis=-1)
++        rnn_out, rnn_state = tf.nn.dynamic_rnn(
++            rnn,
++            inputs,
++            initial_state=rnn_state_in,
++            sequence_length=self.seq_lens,
++            time_major=False,
++            dtype=tf.float32)
++        if rnn_type == "dnc": # Pack mempry
++            dnc_state_as_vector = dnc_state_2_vector(rnn_state)
++            rnn_state = tf_rnn.LSTMStateTuple(dnc_state_as_vector, dnc_state_as_vector) # store copies in h too
++        elif rnn_type == "avg": # Skip connection
++            rnn_out = tf.concat((skip_around, rnn_out), axis=-1) # Order here matters only (avg, avg) stacked; skip will go around both
++        return rnn_out, rnn_state
++
++    def get_rnn(self, cell_type, in_size, output_sz, options):
++        # Create cell
++        if cell_type == "avg":
++            assert in_size%2 == 0, "input to avg must be divisible by two, but got {}".format(in_size)
++            rnn = AverageRNNCell(int(in_size/2),
++                     eps=options.get("average_rnn_eps"),
++                     count=options.get("average_rnn_count"),
++                     sum_instead=options.get("sum_instead"),
++                     straight_through=options.get("straight_through"),
++                     max_instead=options.get("max_instead"))
++        elif cell_type == "dnc":
++              access_config = {
++                  "memory_size": options.get("dnc_access_memory_size"),
++                  "word_size": options.get("dnc_access_word_size"),
++                  "num_reads": options.get("dnc_access_num_reads"),
++                  "num_writes": options.get("dnc_access_num_writes"),
++              }
++              controller_config = {
++                  "hidden_size": options.get("dnc_controller_hidden_size"),
++              }
++              clip_value = options.get("dnc_clip_value")
++              rnn = DNC(access_config, controller_config, output_sz, clip_value)
++        else:
++            assert cell_type == "lstm", cell_type
++            rnn = tf_rnn.BasicLSTMCell(output_sz, state_is_tuple=True, forget_bias=options.get("forget_bias"))
++
++        # Compute memory sizes and output size
++        if cell_type == "dnc":
++            dnc_init_vec = dnc_state_2_vector(rnn.initial_state(1))[0]
++            dnc_mem_len = dnc_init_vec.shape[0]
++            c_sz = dnc_mem_len # Size of c memory
++            h_sz = dnc_mem_len # Size of h memory
++            actual_output_sz = output_sz
++        elif cell_type == "avg":
++            c_sz = rnn.state_size.c
++            h_sz = rnn.state_size.h
++            actual_output_sz = in_size # Output will be same size as input after skip connection is concatenated
++        else:
++            assert cell_type == "lstm", cell_type
++            c_sz = rnn.state_size.c
++            h_sz = rnn.state_size.h
++            actual_output_sz = output_sz
++
++        return rnn, c_sz, h_sz, actual_output_sz
++
++def dnc_state_from_dict(d, dnc_state):
++    """ Construct a DNCState from a dictionary of tensors. Use dnc_state to get the types of all the components """
++    new_linkage = type(dnc_state.access_state.linkage)(link                     = d["link"], 
++                                                       precedence_weights       = d["precedence_weights"])
++    new_access_state = type(dnc_state.access_state)(linkage                     = new_linkage, 
++                                                    memory                      = d["memory"],
++                                                    read_weights                = d["read_weights"],
++                                                    write_weights               = d["write_weights"],
++                                                    usage                       = d["usage"])
++    new_controller_state = type(dnc_state.controller_state)(hidden              = d["hidden"],
++                                                            cell                = d["cell"])
++    new_dnc_state = type(dnc_state)(controller_state                            = new_controller_state,
++                                    access_state                                = new_access_state,
++                                    access_output                               = d["access_output"])
++    return new_dnc_state
++
++def vector_2_dnc_state(dnc, vector_state):
++    """ 
++    Convert a dnc_state represented as a vector (converted by dnc_state_2_vector()) of shape [batch_sz, -1], 
++    into a DNCState 
++    """
++    dnc_state = dnc.initial_state(1)
++    start_index = 0
++    attr_2_new_tensor = {}
++    for item, attr in [(dnc_state.controller_state, "hidden"),
++                       (dnc_state.controller_state, "cell"),
++                       (dnc_state.access_state.linkage, "link"),
++                       (dnc_state.access_state.linkage, "precedence_weights"),
++                       (dnc_state.access_state, "memory"),
++                       (dnc_state.access_state, "read_weights"),
++                       (dnc_state.access_state, "write_weights"),
++                       (dnc_state.access_state, "usage"),
++                       (dnc_state, "access_output")
++                      ]:
++        shape_for_reconstruction = getattr(item, attr).shape[1:]
++        new_tensor_len = np.product(shape_for_reconstruction)
++        new_tensor_data = vector_state[:, start_index:start_index+new_tensor_len]
++        new_tensor = tf.reshape(new_tensor_data, [-1]+shape_for_reconstruction.as_list())
++        attr_2_new_tensor[attr] = new_tensor # Cannot change the attribute dirrectly, since tuples are immutable
++        start_index += new_tensor_len
++    assert start_index == vector_state.shape[-1], (start_index, vector_state.shape[-1])
++    return dnc_state_from_dict(attr_2_new_tensor, dnc_state)
++
++
++def tensors_from_dnc_state(dnc_state):
++    return [dnc_state.controller_state.hidden,
++            dnc_state.controller_state.cell,
++            dnc_state.access_state.linkage.link,
++            dnc_state.access_state.linkage.precedence_weights,
++            dnc_state.access_state.memory,
++            dnc_state.access_state.read_weights,
++            dnc_state.access_state.write_weights,
++            dnc_state.access_state.usage,
++            dnc_state.access_output
++           ]
++
++def dnc_state_2_vector(dnc_state):
++    """ Convert a DNCState, which is a nested tuple of tensors of shape [batch_sz, ...], into tensor of [batch_sz, -1] """
++    to_return_tensor = None
++    for tensor in tensors_from_dnc_state(dnc_state):
++        flattened_tensor = tf.contrib.layers.flatten(tensor) # flatten everything other than batch dim
++        if to_return_tensor is None:
++            to_return_tensor = flattened_tensor
++        else:
++            to_return_tensor = tf.concat((to_return_tensor, flattened_tensor), axis=-1)
++    return to_return_tensor
++
++def gates(lstm, inputs, c, h):
++    """
++    Get the gates produced by 1 step of lstm of the call function. 
++    Mostly copied from rnn.BasicLSTMCell's call function
++    """
++    sigmoid = math_ops.sigmoid
++    one = constant_op.constant(1, dtype=tf.int32)
++    gate_inputs = math_ops.matmul(
++        array_ops.concat([inputs, h], 1), lstm._kernel)
++    gate_inputs = nn_ops.bias_add(gate_inputs, lstm._bias)
++
++    # i = input_gate, j = new_input, f = forget_gate, o = output_gate
++    i, j, f, o = array_ops.split(
++        value=gate_inputs, num_or_size_splits=4, axis=one)
++    forget_bias_tensor = constant_op.constant(lstm._forget_bias, dtype=f.dtype)
++    add = math_ops.add
++    i, j, f, o = sigmoid(i), lstm._activation(j), sigmoid(add(f, forget_bias_tensor)), sigmoid(o)
++
++    multiply = math_ops.multiply
++    new_c = add(multiply(c, f),
++                multiply(i, j))
++    new_h = multiply(lstm._activation(new_c), o)
++
++    return i, j, f, o, new_h
+ 
+-@PublicAPI
+ def add_time_dimension(padded_inputs, seq_lens):
+     """Adds a time dimension to padded inputs.
+ 
+@@ -119,9 +389,7 @@ def add_time_dimension(padded_inputs, seq_lens):
+     return tf.reshape(padded_inputs, new_shape)
+ 
+ 
+-@DeveloperAPI
+ def chop_into_sequences(episode_ids,
+-                        unroll_ids,
+                         agent_indices,
+                         feature_columns,
+                         state_columns,
+@@ -132,8 +400,6 @@ def chop_into_sequences(episode_ids,
+ 
+     Arguments:
+         episode_ids (list): List of episode ids for each step.
+-        unroll_ids (list): List of identifiers for the sample batch. This is
+-            used to make sure sequences are cut between sample batches.
+         agent_indices (list): List of agent ids for each step. Note that this
+             has to be combined with episode_ids for uniqueness.
+         feature_columns (list): List of arrays containing features.
+@@ -153,9 +419,7 @@ def chop_into_sequences(episode_ids,
+ 
+     Examples:
+         >>> f_pad, s_init, seq_lens = chop_into_sequences(
+-                episode_ids=[1, 1, 5, 5, 5, 5],
+-                unroll_ids=[4, 4, 4, 4, 4, 4],
+-                agent_indices=[0, 0, 0, 0, 0, 0],
++                episode_id=[1, 1, 5, 5, 5, 5],
+                 feature_columns=[[4, 4, 8, 8, 8, 8],
+                                  [1, 1, 0, 1, 1, 0]],
+                 state_columns=[[4, 5, 4, 5, 5, 5]],
+@@ -172,9 +436,7 @@ def chop_into_sequences(episode_ids,
+     prev_id = None
+     seq_lens = []
+     seq_len = 0
+-    unique_ids = np.add(
+-        np.add(episode_ids, agent_indices),
+-        np.array(unroll_ids) << 32)
++    unique_ids = np.add(episode_ids, agent_indices)
+     for uid in unique_ids:
+         if (prev_id is not None and uid != prev_id) or \
+                 seq_len >= max_seq_len:
+@@ -214,4 +476,4 @@ def chop_into_sequences(episode_ids,
+             i += l
+         initial_states.append(np.array(s_init))
+ 
+-    return feature_sequences, initial_states, np.array(seq_lens)
+\ No newline at end of file
++    return feature_sequences, initial_states, np.array(seq_lens)

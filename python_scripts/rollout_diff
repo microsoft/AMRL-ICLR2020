@@ -1,0 +1,322 @@
+diff --git a/Users/jake/Desktop/rollout.py b/python_scripts/rollout_maze.py
+old mode 100644
+new mode 100755
+index 59a3c89..35aefe6
+--- a/Users/jake/Desktop/rollout.py
++++ b/python_scripts/rollout_maze.py
+@@ -1,4 +1,17 @@
+ #!/usr/bin/env python
++'''
++This file contains modified code from rllib
++(https://github.com/ray-project/ray/blob/f600591468d2226fb8ad700294c18cf215c5809d/python/ray/rllib/rollout.py)
++To recover from the given diff, you may use: patch rollout.py rollout_diff
++
++This script creates rollout for trained models from experiments in AMRL paper (https://iclr.cc/virtual_2020/poster_Bkl7bREtDr.html).
++It modifies the rollout.py script to work with AMRL experiments.
++Example usage is below.
++Note: This script should also fix a bug present in rollout.py (in this version of rllib)
++      that initializes LSTMs incorrectly.
++Note:
++    # t_maze can render to terminal but currently not set up to save the terminal output as a video.
++'''
+ 
+ from __future__ import absolute_import
+ from __future__ import division
+@@ -9,52 +22,94 @@ import collections
+ import json
+ import os
+ import pickle
++import torch
+ 
+ import gym
+ import ray
++import cv2
++import time
++import numpy as np
++from pathlib import Path
++from gym.spaces import Tuple
+ from ray.rllib.agents.registry import get_agent_class
+ from ray.rllib.env import MultiAgentEnv
+-from ray.rllib.env.base_env import _DUMMY_AGENT_ID
++from ray.rllib.env.async_vector_env import _DUMMY_AGENT_ID
+ from ray.rllib.evaluation.sample_batch import DEFAULT_POLICY_ID
+ from ray.tune.util import merge_dicts
+ 
+ EXAMPLE_USAGE = """
+-Example Usage via RLlib CLI:
+-    rllib rollout /tmp/ray/checkpoint_dir/checkpoint-0 --run DQN
+-    --env CartPole-v0 --steps 1000000 --out rollouts.pkl
+-
+-Example Usage via executable:
+-    ./rollout.py /tmp/ray/checkpoint_dir/checkpoint-0 --run DQN
+-    --env CartPole-v0 --steps 1000000 --out rollouts.pkl
++Example Usage:
++    python rollout_maze.py AMRL_results/data/T-LN/LSTM_Run1/checkpoint_63/checkpoint-63 --env tmaze-v0
+ """
+ 
+-# Note: if you use any custom models or envs, register them here first, e.g.:
+-#
+-# ModelCatalog.register_custom_model("pa_model", ParametricActionsModel)
+-# register_env("pa_cartpole", lambda _: ParametricActionCartpole(10))
++# Register AMRL environments:
++
++from ray.tune.registry import register_env
++
++from ray.rllib.examples.mine_maze import MineMaze, MINEMAZE_ENV_KEY, file_path_to_numpy_img
++register_env(MINEMAZE_ENV_KEY, lambda config: MineMaze(config))
++
++from ray.rllib.examples.t_maze import TMaze, TMAZE_ENV_KEY
++register_env(TMAZE_ENV_KEY, lambda config: TMaze(config))
++
++from ray.rllib.examples.mine_chicken import MineChicken, MINECHICKEN_ENV_KEY
++register_env(MINECHICKEN_ENV_KEY, lambda config: MineChicken(config))
+ 
++# Make an empty direcrtory for saving the rollouts from this trial:
++
++repo_base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))))
++SAVE_DIR = os.path.join(repo_base_dir, "AMRL_rollouts")
++DEFAULT_VIDEO_OUT = os.path.join(SAVE_DIR, "rollout_video")
++if os.path.isdir(SAVE_DIR):
++    from shutil import rmtree
++    rmtree(SAVE_DIR)
++os.mkdir(SAVE_DIR)
++
++# Note: If you want to use an environment that is different from the one the model was trained with, you should be able to replace the env config in the 
++# lambda function. For example, replace the above line,
++    # register_env(MINECHICKEN_ENV_KEY, lambda config: MineChicken(config))
++# with
++    # import yaml
++    # with open("/home/jake/saves/singlestep/ENV.yaml", 'r') as env_file:
++    #     env_config = yaml.load(env_file)
++    # env_config = env_config["env_config"]
++    # for key in ['dir_name', 'run_tag', 'timesteps_total', 'num_workers', 'num_envs_per_worker', 'num_gpus']:
++    #     if key in env_config:
++    #         del env_config[key]
++    #
++    # register_env(MINECHICKEN_ENV_KEY, lambda config: MineChicken(env_config))
++
++def write_video(observations, out_path, fps=3, end_repeat=10, start_repeat=0):
++    start_imgs = [observations[0] for _ in range(start_repeat)]
++    end_imgs = [observations[-1] for _ in range(end_repeat)]
++    observations = start_imgs + observations + end_imgs
++    shape = observations[0].shape[:-1]
++    writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"MJPG"), fps, shape)
++    for obs in observations:
++        obs = (obs * 128) + 128 # unnormalize
++        obs = np.clip(np.round(obs), 0, 256)
++        obs = obs.astype(np.uint8)
++        obs = np.flip(obs, axis=(0,2))
++        writer.write(obs)
++    writer.release()
+ 
+ def create_parser(parser_creator=None):
+     parser_creator = parser_creator or argparse.ArgumentParser
+     parser = parser_creator(
+         formatter_class=argparse.RawDescriptionHelpFormatter,
+-        description="Roll out a reinforcement learning agent "
+-        "given a checkpoint.",
++        description="Roll out a reinforcement learning agent from AMRL experiments given a checkpoint. Rollouts will be saved (as videos) unless using tmaze, which has vector observations. Default save dir: {}".format(SAVE_DIR),
+         epilog=EXAMPLE_USAGE)
+ 
+     parser.add_argument(
+         "checkpoint", type=str, help="Checkpoint from which to roll out.")
+     required_named = parser.add_argument_group("required named arguments")
+     required_named.add_argument(
++        "--env", type=str, help="The gym environment to use. tmaze-v0, minemaze-v0, and minechicken-v0 are allowed. These are specified by an ENV_KEY at the top of file.")
++    parser.add_argument(
+         "--run",
++        default="PPO",
+         type=str,
+-        required=True,
+-        help="The algorithm or model to train. This may refer to the name "
+-        "of a built-on algorithm (e.g. RLLib's DQN or PPO), or a "
+-        "user-defined trainable function or class registered in the "
+-        "tune registry.")
+-    required_named.add_argument(
+-        "--env", type=str, help="The gym environment to use.")
++        help="The algorithm used in training. For AMRL, PPO was used in the paper. You should change this if you changed your env config yaml.")
+     parser.add_argument(
+         "--no-render",
+         default=False,
+@@ -62,14 +117,34 @@ def create_parser(parser_creator=None):
+         const=True,
+         help="Surpress rendering of the environment.")
+     parser.add_argument(
+-        "--steps", default=10000, help="Number of steps to roll out.")
++        "--best",
++        default=False,
++        action="store_const",
++        const=True,
++        help="Take best action instead of sampling from policy. (Currently only for RNNs)")
++    parser.add_argument(
++        "--term",
++        default=False,
++        action="store_const",
++        const=True,
++        help="Intended for the minechicken-v0 environment. Add the predefined images (chickens or lava) indicating whether last reward was positive.")
++    parser.add_argument(
++        "--steps", default=10000, help="Max number of steps to roll out.")
++    parser.add_argument("--ep", type=int, default=1, help="Max number of episodes to rollout.")
+     parser.add_argument("--out", default=None, help="Output filename.")
++    parser.add_argument("--video_out", type=str, default=DEFAULT_VIDEO_OUT,
++        help="Output filepath without extension. (More will be added to the name.)")
+     parser.add_argument(
+         "--config",
+         default="{}",
+         type=json.loads,
+         help="Algorithm-specific configuration (e.g. env, hyperparams). "
+         "Surpresses loading of configuration from checkpoint.")
++    parser.add_argument(
++        "--weights_path",
++        default=None,
++        type=str,
++        help="Path to save network weights of the agent")
+     return parser
+ 
+ 
+@@ -102,7 +177,7 @@ def run(args, parser):
+     agent = cls(env=args.env, config=config)
+     agent.restore(args.checkpoint)
+     num_steps = int(args.steps)
+-    rollout(agent, args.env, num_steps, args.out, args.no_render)
++    rollout(agent, args.env, num_steps, args.ep, args.video_out, args.best, args.term, args.weights_path, args.out, args.no_render)
+ 
+ 
+ class DefaultMapping(collections.defaultdict):
+@@ -117,7 +192,7 @@ def default_policy_agent_mapping(unused_agent_id):
+     return DEFAULT_POLICY_ID
+ 
+ 
+-def rollout(agent, env_name, num_steps, out=None, no_render=True):
++def rollout(agent, env_name, num_steps, num_ep, video_out, best, add_terminal_imgs, weights_path=None, out=None, no_render=True):
+     policy_agent_mapping = default_policy_agent_mapping
+ 
+     if hasattr(agent, "local_evaluator"):
+@@ -130,22 +205,30 @@ def rollout(agent, env_name, num_steps, out=None, no_render=True):
+         policy_map = agent.local_evaluator.policy_map
+         state_init = {p: m.get_initial_state() for p, m in policy_map.items()}
+         use_lstm = {p: len(s) > 0 for p, s in state_init.items()}
+-        action_init = {
+-            p: m.action_space.sample()
+-            for p, m in policy_map.items()
+-        }
++        action_init = {}
++        for p, m in policy_map.items():
++            action_init[p] = np.array(m.action_space.sample())
++        if type(m.action_space) is Tuple: # minemaze actually uses a variable length action space. E.g. action = (1,) not 1
++            action_init[p] = action_init[p].reshape(len(m.action_space),)
+     else:
+         env = gym.make(env_name)
+         multiagent = False
+         use_lstm = {DEFAULT_POLICY_ID: False}
+ 
+-    if out is not None:
+-        rollouts = []
++    rollouts = []
++    if weights_path is not None:
++        if hasattr(agent, "local_evaluator"):
++            weights = agent.local_evaluator.get_weights()
++        else:
++            weights = agent.get_weights()
++        torch.save(weights, args.weights_path)
++    
+     steps = 0
+-    while steps < (num_steps or steps + 1):
++    ep = 0 # episode
++    total_rewards = []
++    while steps < (num_steps or steps + 1) and ep < num_ep:
+         mapping_cache = {}  # in case policy_agent_mapping is stochastic
+-        if out is not None:
+-            rollout = []
++        rollout = []
+         obs = env.reset()
+         agent_states = DefaultMapping(
+             lambda agent_id: state_init[mapping_cache[agent_id]])
+@@ -155,6 +238,9 @@ def rollout(agent, env_name, num_steps, out=None, no_render=True):
+         done = False
+         reward_total = 0.0
+         while not done and steps < (num_steps or steps + 1):
++            if env_name == TMAZE_ENV_KEY and not no_render:
++                time.sleep(0.01) # tmaze needs to sleep so that you have time to see agent render
++                os.system('cls||clear') # clear screen between observations
+             multi_obs = obs if multiagent else {_DUMMY_AGENT_ID: obs}
+             action_dict = {}
+             for agent_id, a_obs in multi_obs.items():
+@@ -163,12 +249,14 @@ def rollout(agent, env_name, num_steps, out=None, no_render=True):
+                         agent_id, policy_agent_mapping(agent_id))
+                     p_use_lstm = use_lstm[policy_id]
+                     if p_use_lstm:
+-                        a_action, p_state, _ = agent.compute_action(
++                        a_action, p_state, info = agent.compute_action(
+                             a_obs,
+                             state=agent_states[agent_id],
+                             prev_action=prev_actions[agent_id],
+                             prev_reward=prev_rewards[agent_id],
+                             policy_id=policy_id)
++                        if best:
++                            a_action = np.argmax(info['logits'])
+                         agent_states[agent_id] = p_state
+                     else:
+                         a_action = agent.compute_action(
+@@ -176,12 +264,15 @@ def rollout(agent, env_name, num_steps, out=None, no_render=True):
+                             prev_action=prev_actions[agent_id],
+                             prev_reward=prev_rewards[agent_id],
+                             policy_id=policy_id)
++                    a_action = np.squeeze(a_action)
++                    if type(policy_map[policy_id].action_space) is Tuple:
++                        a_action = a_action.reshape(len(policy_map[policy_id].action_space),)
+                     action_dict[agent_id] = a_action
+                     prev_actions[agent_id] = a_action
+             action = action_dict
+ 
+             action = action if multiagent else action[_DUMMY_AGENT_ID]
+-            next_obs, reward, done, _ = env.step(action)
++            next_obs, reward, done, info = env.step(action)
+             if multiagent:
+                 for agent_id, r in reward.items():
+                     prev_rewards[agent_id] = r
+@@ -195,19 +286,38 @@ def rollout(agent, env_name, num_steps, out=None, no_render=True):
+                 reward_total += reward
+             if not no_render:
+                 env.render()
+-            if out is not None:
+-                rollout.append([obs, action, next_obs, reward, done])
++            rollout.append([obs, action, next_obs, reward, done, info])
+             steps += 1
+             obs = next_obs
+-        if out is not None:
+-            rollouts.append(rollout)
++        rollouts.append(rollout)
++        total_rewards.append(reward_total)
+         print("Episode reward", reward_total)
++        if env_name == TMAZE_ENV_KEY and not no_render:
++            time.sleep(2)
++        ep_observations = [obs for obs, action, next_obs, reward, done, info in rollout]
++        ep_observations.append(rollout[-1][2]) # next (terminal) obs
++        if add_terminal_imgs:
++            parent_dir = os.path.dirname(os.path.realpath(__file__))
++            img_dir = os.path.join(parent_dir, "examples", "mine_chicken_data", "42_resolution")
++            if rollout[-1][3] > 0:
++                term_obs = file_path_to_numpy_img(os.path.join(img_dir, "goal.png"))
++            else:
++                term_obs = file_path_to_numpy_img(os.path.join(img_dir, "lava.png"))
++            term_obs = term_obs.astype(np.float32)
++            term_obs = (term_obs - 128)/128
++            ep_observations.append(term_obs)
++        reward_total = np.round(reward_total, 3)
++        if not args.env == TMAZE_ENV_KEY: # t_maze can render to terminal but currently not set up to save the terminal output as a video.
++            write_video(ep_observations, video_out+"_ep="+str(ep)+"_R="+str(reward_total)+".avi")
++        ep += 1
+ 
+     if out is not None:
+         pickle.dump(rollouts, open(out, "wb"))
+ 
++    print("Average Total Reward:", np.mean(total_rewards))
++
+ 
+ if __name__ == "__main__":
+     parser = create_parser()
+     args = parser.parse_args()
+-    run(args, parser)
+\ No newline at end of file
++    run(args, parser)
