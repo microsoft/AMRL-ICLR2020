@@ -1,0 +1,48 @@
+# Example yaml for minecraft maze environment. 
+# Note: This is a combined env and model example. 
+#       For experiments with models defined seperately, see other folders in this directory.
+temp_minemaze: # Folder name for output
+    trial_name: AMRL-AVG # String must be in all CAPS, dashes, and underscores. It will be used as the model name. It should be unique within the directory defined on prior line.
+    run: PPO
+    checkpoint_freq: 1
+    checkpoint_at_end: True
+    stop:
+        timesteps_total: 250000
+    config: 
+        opt_type: adam
+        lr: 0.0005
+        gamma: 0.98
+        num_workers: 5
+        num_envs_per_worker: 2
+        num_gpus: 1
+        observation_filter: "NoFilter"
+        # In order to avoid Rllib bugs in old version, we specify truncate but make sure sample_batch_size > timeout in env
+        # (Note, since sample_batch_size > sgd_minibatch_size, this should break if not the case)
+        sample_batch_size: 200 # number of steps into episode to sample.
+        train_batch_size: 4000 #  number of steps to wait until train
+        sgd_minibatch_size: 200 # must be > min(timeout, sample_batch_size), I believe, to hold at least one episode (e.g. PPO)
+        num_sgd_iter: 30
+        batch_mode: "truncate_episodes" # "complete_episodes" or "truncate_episodes"
+        fetch_lstm_gates: False # These fetches will automiatcally be saved to disk by maze_runner.py
+        model:
+            use_lstm: True
+            max_seq_len: 10000
+            slot1: lstm
+            slot2: avg
+            sum_instead: False
+            max_instead: False
+            straight_through: True
+        env_config:
+            num_rooms: 2
+            multi_step_indicator: False
+            num_single_step_repeats: 1
+            success_r: 4
+            fail_r: -3
+            check_success_r: 1
+            check_fail_r: -1
+            reward_per_progress: 0.1
+            timeout: 150
+            high_res: False
+            noise: null
+        
+ 

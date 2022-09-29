@@ -1,0 +1,367 @@
+diff --git a/Users/jake/Desktop/catalog.py b/models/catalog.py
+index 35145b6..69ba19c 100644
+--- a/Users/jake/Desktop/catalog.py
++++ b/models/catalog.py
+@@ -2,6 +2,12 @@ from __future__ import absolute_import
+ from __future__ import division
+ from __future__ import print_function
+ 
++"""
++This file contains modified code from rllib
++(https://github.com/ray-project/ray/blob/f600591468d2226fb8ad700294c18cf215c5809d/python/ray/rllib/models/catalog.py)
++To recover from the given diff, you may use: patch catalog.py catalog_diff
++"""
++
+ import gym
+ import logging
+ import numpy as np
+@@ -11,17 +17,15 @@ from functools import partial
+ from ray.tune.registry import RLLIB_MODEL, RLLIB_PREPROCESSOR, \
+     _global_registry
+ 
+-from ray.rllib.models.extra_spaces import Simplex
+-from ray.rllib.models.action_dist import (Categorical, MultiCategorical,
+-                                          Deterministic, DiagGaussian,
+-                                          MultiActionDistribution, Dirichlet)
+-from ray.rllib.models.torch_action_dist import (TorchCategorical,
+-                                                TorchDiagGaussian)
++from ray.rllib.models.action_dist import (
++    Categorical, Deterministic, DiagGaussian, MultiActionDistribution)
++from ray.rllib.models.action_dist_torch import (
++    CategoricalTorch, DeterministicTorch, DiagGaussianTorch, 
++    MultiActionDistributionTorch)
+ from ray.rllib.models.preprocessors import get_preprocessor
+ from ray.rllib.models.fcnet import FullyConnectedNetwork
+ from ray.rllib.models.visionnet import VisionNetwork
+ from ray.rllib.models.lstm import LSTM
+-from ray.rllib.utils.annotations import DeveloperAPI, PublicAPI
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -34,8 +38,8 @@ MODEL_DEFAULTS = {
+     # Nonlinearity for built-in convnet
+     "conv_activation": "relu",
+     # Nonlinearity for fully connected net (tanh, relu)
+-    "fcnet_activation": "tanh",
+-    # Number of hidden layers for fully connected net
++    "fcnet_activation": "relu",
++    # Number of hidden nodes per layer for fully connected net
+     "fcnet_hiddens": [256, 256],
+     # For control envs, documented in ray.rllib.models.Model
+     "free_log_std": False,
+@@ -43,14 +47,54 @@ MODEL_DEFAULTS = {
+     "squash_to_range": False,
+ 
+     # == LSTM ==
+-    # Whether to wrap the model with a LSTM
++    # Whether to wrap the model with a memory module defined in lstm.py
+     "use_lstm": False,
++    # Slot 1 of two slots for rnns that can be conbined. Options are: "lstm", "dnc", "avg"
++    # Note: The best performing models from AMRL paper (https://iclr.cc/virtual_2020/poster_Bkl7bREtDr.html), AMRL-Max and AMRL-Avg, would use (lstm, avg).
++    # Note  that for "avg", the inputs MUST be divisible by 2, since skip connections will be added around the avg, concatenating its input to its output.
++    # Note: Note: skip connections will be added around the avg, concatenating its input to its output, regardless of slot.
++    # Note: Average model is defined in average_rnn.py and used in lstm.py, and is from AMRL paper (https://iclr.cc/virtual_2020/poster_Bkl7bREtDr.html).
++    # Note: For (stack1, stack2), known viable configurations include: (lstm, None), (DNC, None), (lstm, lstm), (lstm, avg)
++    "slot1": "lstm",
++    # Slot 2 of two slots for rnns that can be conbined. Options are: "lstm", "dnc", "avg", None
++    "slot2": "avg",
++    # Defines output size for slot1. (Equal to cell size if lstm. Ignored if avg.)
++    "slot1_output_size": 256,
++    # Defines output size for slot2. (Equal to cell size if lstm. Ignored if avg.)
++    "slot2_output_size": 256,
++    # Whether to stack slot1 and slot2, so that slot1 feeds into slot2, or run in tandem and concatenate outputs.
++    "stacked_rnns": True,
++    # The size (or None) for the penulitmate layer before the final linear layer
++    "final_hidden": 256, 
++    # DNC parameters (note that DNC also use lstm_cell_size as its output size):
++    "dnc_access_memory_size": 16,
++    "dnc_access_word_size": 16,
++    "dnc_access_num_reads": 4,
++    "dnc_access_num_writes": 1,
++    "dnc_controller_hidden_size": 256,
++    "dnc_clip_value": 20,
++    # Whether the average rnn should append the timestep to the running average output
++    "average_rnn_count": False,
++    # Value used in average_rnn
++    # Note: can be None (null in yaml). Otherwise, 0.001 Is probably a decent value since sum(1/t^(1+0.001)) converges quickly 
++    #       but t^(1+0.001) is approximately t for well into trillion of steps
++    "average_rnn_eps": None,
++    # Whether to use a sum instead of an average for any average_rnn. (Turns AVG in AMRL paper into SUM)
++    "sum_instead": False,
++    # Whether to use a max instead of an average for any average_rnn. (Turns AVG in AMRL paper into MAX)
++    "max_instead": False,
++    # Whether to scale gradients as normal when scaling sum down to average in average_rnn, 
++    # or pass gradient straight through
++    # Note: Setting this to "true" makes a AVG or MAX model in AMRL paper into AMRL-AVG or AMRL-Max
++    "straight_through": True,
++    # The additional forget bias, if using an LSTM,
++    "forget_bias": 1.0,
+     # Max seq len for training the LSTM, defaults to 20
+     "max_seq_len": 20,
+-    # Size of the LSTM cell
+-    "lstm_cell_size": 256,
+     # Whether to feed a_{t-1}, r_{t-1} to LSTM
+     "lstm_use_prev_action_reward": False,
++    # Whether to concatenate the inputs to memory units to the outputs
++    "parallel_input": False,
+ 
+     # == Atari ==
+     # Whether to enable framestack for Atari envs
+@@ -74,7 +118,6 @@ MODEL_DEFAULTS = {
+ # yapf: enable
+ 
+ 
+-@PublicAPI
+ class ModelCatalog(object):
+     """Registry of models, preprocessors, and action distributions for envs.
+ 
+@@ -90,15 +133,13 @@ class ModelCatalog(object):
+     """
+ 
+     @staticmethod
+-    @DeveloperAPI
+-    def get_action_dist(action_space, config, dist_type=None, torch=False):
++    def get_action_dist(action_space, config, dist_type=None):
+         """Returns action distribution class and size for the given action space.
+ 
+         Args:
+             action_space (Space): Action space of the target gym env.
+             config (dict): Optional model config.
+             dist_type (str): Optional identifier of the action distribution.
+-            torch (bool):  Optional whether to return PyTorch distribution.
+ 
+         Returns:
+             dist_class (ActionDistribution): Python class of the distribution.
+@@ -114,7 +155,7 @@ class ModelCatalog(object):
+                     "Consider reshaping this into a single dimension, "
+                     "using a Tuple action space, or the multi-agent API.")
+             if dist_type is None:
+-                dist = TorchDiagGaussian if torch else DiagGaussian
++                dist = DiagGaussian
+                 if config.get("squash_to_range"):
+                     raise ValueError(
+                         "The squash_to_range option is deprecated. See the "
+@@ -123,8 +164,7 @@ class ModelCatalog(object):
+             elif dist_type == "deterministic":
+                 return Deterministic, action_space.shape[0]
+         elif isinstance(action_space, gym.spaces.Discrete):
+-            dist = TorchCategorical if torch else Categorical
+-            return dist, action_space.n
++            return Categorical, action_space.n
+         elif isinstance(action_space, gym.spaces.Tuple):
+             child_dist = []
+             input_lens = []
+@@ -133,27 +173,60 @@ class ModelCatalog(object):
+                     action, config)
+                 child_dist.append(dist)
+                 input_lens.append(action_size)
+-            if torch:
+-                raise NotImplementedError
+             return partial(
+                 MultiActionDistribution,
+                 child_distributions=child_dist,
+                 action_space=action_space,
+                 input_lens=input_lens), sum(input_lens)
+-        elif isinstance(action_space, Simplex):
+-            if torch:
+-                raise NotImplementedError
+-            return Dirichlet, action_space.shape[0]
+-        elif isinstance(action_space, gym.spaces.multi_discrete.MultiDiscrete):
+-            if torch:
+-                raise NotImplementedError
+-            return MultiCategorical, int(sum(action_space.nvec))
++
++        raise NotImplementedError("Unsupported args: {} {}".format(
++            action_space, dist_type))
++    
++    @staticmethod
++    def get_torch_action_dist(action_space, config=None, dist_type=None):
++        """Returns PyTorch action distribution class and size for the given action space.
++
++        Args:
++            action_space (Space): Action space of the target gym env.
++            config (dict): Optional model config.
++            dist_type (str): Optional identifier of the action distribution.
++
++        Returns:
++            dist_class (ActionDistribution): Python class of the distribution.
++            dist_dim (int): The size of the input vector to the distribution.
++        """
++
++        if isinstance(action_space, list):
++            action_space = gym.spaces.Tuple(action_space)
++        config = config or {}
++        if isinstance(action_space, gym.spaces.Box):
++            if dist_type is None:
++                dist = DiagGaussianTorch
++                if config.get("squash_to_range"):
++                    dist = squash_to_range_torch(dist, action_space.low,
++                                            action_space.high)
++                return dist, action_space.shape[0] * 2
++            elif dist_type == 'deterministic':
++                return DeterministicTorch, action_space.shape[0]
++        elif isinstance(action_space, gym.spaces.Discrete):
++            return CategoricalTorch, action_space.n
++        elif isinstance(action_space, gym.spaces.Tuple):
++            child_dist = []
++            input_lens = []
++            for action in action_space.spaces:
++                dist, action_size = ModelCatalog.get_torch_action_dist(action)
++                child_dist.append(dist)
++                input_lens.append(action_size)
++            return partial(
++                MultiActionDistributionTorch,
++                child_distributions=child_dist,
++                action_space=action_space,
++                input_lens=input_lens), sum(input_lens)
+ 
+         raise NotImplementedError("Unsupported args: {} {}".format(
+             action_space, dist_type))
+ 
+     @staticmethod
+-    @DeveloperAPI
+     def get_action_placeholder(action_space):
+         """Returns an action placeholder that is consistent with the action space
+ 
+@@ -181,23 +254,13 @@ class ModelCatalog(object):
+                 tf.int64 if all_discrete else tf.float32,
+                 shape=(None, size),
+                 name="action")
+-        elif isinstance(action_space, Simplex):
+-            return tf.placeholder(
+-                tf.float32, shape=(None, action_space.shape[0]), name="action")
+-        elif isinstance(action_space, gym.spaces.multi_discrete.MultiDiscrete):
+-            return tf.placeholder(
+-                tf.as_dtype(action_space.dtype),
+-                shape=(None, len(action_space.nvec)),
+-                name="action")
+         else:
+             raise NotImplementedError("action space {}"
+                                       " not supported".format(action_space))
+ 
+     @staticmethod
+-    @DeveloperAPI
+     def get_model(input_dict,
+                   obs_space,
+-                  action_space,
+                   num_outputs,
+                   options,
+                   state_in=None,
+@@ -208,11 +271,10 @@ class ModelCatalog(object):
+             input_dict (dict): Dict of input tensors to the model, including
+                 the observation under the "obs" key.
+             obs_space (Space): Observation space of the target gym env.
+-            action_space (Space): Action space of the target gym env.
+             num_outputs (int): The size of the output vector of the model.
+             options (dict): Optional args to pass to the model constructor.
+             state_in (list): Optional RNN state in tensors.
+-            seq_lens (Tensor): Optional RNN sequence length tensor.
++            seq_in (Tensor): Optional RNN sequence length tensor.
+ 
+         Returns:
+             model (models.Model): Neural network model.
+@@ -220,36 +282,35 @@ class ModelCatalog(object):
+ 
+         assert isinstance(input_dict, dict)
+         options = options or MODEL_DEFAULTS
+-        model = ModelCatalog._get_model(input_dict, obs_space, action_space,
+-                                        num_outputs, options, state_in,
+-                                        seq_lens)
++        model = ModelCatalog._get_model(input_dict, obs_space, num_outputs,
++                                        options, state_in, seq_lens)
+ 
+         if options.get("use_lstm"):
+             copy = dict(input_dict)
+             copy["obs"] = model.last_layer
+             feature_space = gym.spaces.Box(
+                 -1, 1, shape=(model.last_layer.shape[1], ))
+-            model = LSTM(copy, feature_space, action_space, num_outputs,
+-                         options, state_in, seq_lens)
++            # TODO: You probably want to copy over self-supervised loss from other model,
++            # I'm not sure whether there is also other information that should be considered.
++            model = LSTM(copy, feature_space, num_outputs, options, state_in,
++                         seq_lens)
+ 
+-        logger.debug(
+-            "Created model {}: ({} of {}, {}, {}, {}) -> {}, {}".format(
+-                model, input_dict, obs_space, action_space, state_in, seq_lens,
+-                model.outputs, model.state_out))
++        logger.debug("Created model {}: ({} of {}, {}, {}) -> {}, {}".format(
++            model, input_dict, obs_space, state_in, seq_lens, model.outputs,
++            model.state_out))
+ 
+         model._validate_output_shape()
+         return model
+ 
+     @staticmethod
+-    def _get_model(input_dict, obs_space, action_space, num_outputs, options,
+-                   state_in, seq_lens):
++    def _get_model(input_dict, obs_space, num_outputs, options, state_in,
++                   seq_lens):
+         if options.get("custom_model"):
+             model = options["custom_model"]
+             logger.debug("Using custom model {}".format(model))
+             return _global_registry.get(RLLIB_MODEL, model)(
+                 input_dict,
+                 obs_space,
+-                action_space,
+                 num_outputs,
+                 options,
+                 state_in=state_in,
+@@ -258,14 +319,12 @@ class ModelCatalog(object):
+         obs_rank = len(input_dict["obs"].shape) - 1
+ 
+         if obs_rank > 1:
+-            return VisionNetwork(input_dict, obs_space, action_space,
+-                                 num_outputs, options)
++            return VisionNetwork(input_dict, obs_space, num_outputs, options)
+ 
+-        return FullyConnectedNetwork(input_dict, obs_space, action_space,
+-                                     num_outputs, options)
++        return FullyConnectedNetwork(input_dict, obs_space, num_outputs,
++                                     options)
+ 
+     @staticmethod
+-    @DeveloperAPI
+     def get_torch_model(obs_space,
+                         num_outputs,
+                         options=None,
+@@ -312,7 +371,6 @@ class ModelCatalog(object):
+         return PyTorchFCNet(obs_space, num_outputs, options)
+ 
+     @staticmethod
+-    @DeveloperAPI
+     def get_preprocessor(env, options=None):
+         """Returns a suitable preprocessor for the given env.
+ 
+@@ -323,7 +381,6 @@ class ModelCatalog(object):
+                                                        options)
+ 
+     @staticmethod
+-    @DeveloperAPI
+     def get_preprocessor_for_space(observation_space, options=None):
+         """Returns a suitable preprocessor for the given observation space.
+ 
+@@ -355,7 +412,6 @@ class ModelCatalog(object):
+         return prep
+ 
+     @staticmethod
+-    @PublicAPI
+     def register_custom_preprocessor(preprocessor_name, preprocessor_class):
+         """Register a custom preprocessor class by name.
+ 
+@@ -370,7 +426,6 @@ class ModelCatalog(object):
+                                   preprocessor_class)
+ 
+     @staticmethod
+-    @PublicAPI
+     def register_custom_model(model_name, model_class):
+         """Register a custom model class by name.
+ 
+@@ -381,4 +436,4 @@ class ModelCatalog(object):
+             model_name (str): Name to register the model under.
+             model_class (type): Python class of the model.
+         """
+-        _global_registry.register(RLLIB_MODEL, model_name, model_class)
+\ No newline at end of file
++        _global_registry.register(RLLIB_MODEL, model_name, model_class)

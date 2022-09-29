@@ -1,0 +1,33 @@
+place_holder: # Directory to save model in. Can put name instead of "place_holder", since overriten by ENV.yaml
+    # for trial_name, please do one of the following:
+    #   1) Leave as "", the empty string, and the model name will be set as the name of this yaml. (This is cleanest.)
+    #   2) Put a custom model name in CAPS and underscores.
+    trial_name: ""
+    run: PPO
+    checkpoint_freq: 5
+    checkpoint_at_end: True
+    stop:
+        timesteps_total:     -1 # Placeholder number since specified in ENV.yaml
+    config: 
+        opt_type: adam # overritten by --grid in maze_runer.py
+        lr: 0.0005     # overritten by --grid in maze_runer.py
+        gamma: 0.98
+        num_workers:         -1 # Placeholder number since specified in ENV.yaml
+        num_envs_per_worker: -1 # Placeholder number since specified in ENV.yaml
+        num_gpus:            -1 # Placeholder number since specified in ENV.yaml
+        observation_filter: "NoFilter"
+        sample_batch_size: 205  # number of steps into episode to sample. Timeout (from Env config) < 205. 205 ensures backprop through entirety or error.
+        train_batch_size: 4000  # number of steps to wait until train
+        sgd_minibatch_size: 200 # must be > min(timeout, sample_batch_size), I believe, to hold at least one episode (e.g. PPO)
+        num_sgd_iter: 30
+        batch_mode: "truncate_episodes" # "complete_episodes" or "truncate_episodes"
+        fetch_lstm_gates: False # These fetches will automatically be saved to disk by callbacks in maze_runner.py
+        model:
+            use_lstm: True
+            max_seq_len: 10000
+            slot1: lstm
+            slot2: lstm
+            sum_instead: False
+            max_instead: False
+            straight_through: True
+        
