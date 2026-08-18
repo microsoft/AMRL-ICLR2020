@@ -233,7 +233,7 @@ def get_experiment_dict_from_yaml(
     '''
     with open(yaml_path, 'r') as experiment_file:
         try:
-            experiment_dict = yaml.load(experiment_file)
+            experiment_dict = yaml.safe_load(experiment_file)
         except yaml.YAMLError as err:
             print(err)
     assert len(experiment_dict) == 1, len(experiment_dict) # Only one experiment per yaml
@@ -248,7 +248,7 @@ def get_experiment_dict_from_yaml(
         assert "env_config" not in d["config"], "Cannot have env specified in yaml if specified in just_env_file"
         with open(just_env_file, 'r') as env_file:
             try:
-                env_config = yaml.load(env_file)
+                env_config = yaml.safe_load(env_file)
             except yaml.YAMLError as err:
                 print(err)
         assert "env_config" in env_config
